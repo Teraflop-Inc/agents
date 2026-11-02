@@ -1,0 +1,293 @@
+"""End-to-end check of the VLM Run plugin in a real LiveKit Cloud room.
+
+Not part of the PR: it lives on the vlmrun-e2e branch and runs from a workflow_dispatch job.
+
+  1. plugin   A fake camera publishes a red circle with "STOP", then a blank frame.
+              VisionStream must flip, VisionTools must segment and read "STOP", and
+              DecisionModel must answer about a frame taken from the room.
+  2. watcher  The camera shows a photo with people. The watcher example must publish
+              VLM Run decisions to the room and speak a greeting.
+  3. camera   The camera shows the red circle. A chat message asks its color; the camera
+              example (vlmrun.LLM) must answer "red".
+
+Prints PASS/FAIL per check and exits non-zero on any failure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+from livekit import api, rtc
+from livekit.agents import llm, utils
+from livekit.plugins import vlmrun
+from livekit.plugins.vlmrun import tools as vtools
+
+URL = os.environ["LIVEKIT_URL"]
+KEY = os.environ["LIVEKIT_API_KEY"]
+SECRET = os.environ["LIVEKIT_API_SECRET"]
+REPO = Path(__file__).resolve().parents[2]
+EXAMPLES = REPO / "examples" / "voice_agents"
+PEOPLE_PHOTO = "https://ultralytics.com/images/bus.jpg"
+W, H = 640, 480
+
+results: list[tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    results.append((name, ok, detail))
+    print(f"{'PASS' if ok else 'FAIL'} {name} {detail}", flush=True)
+
+
+def token(identity: str, room: str) -> str:
+    return (
+        api.AccessToken(KEY, SECRET)
+        .with_identity(identity)
+        .with_grants(api.VideoGrants(room_join=True, room=room))
+        .to_jwt()
+    )
+
+
+def red_stop() -> Image.Image:
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    d.ellipse((170, 40, 470, 340), fill="red")
+    d.text((200, 360), "STOP", fill="black", font=ImageFont.load_default(size=96))
+    return img
+
+
+def blank() -> Image.Image:
+    return Image.new("RGB", (W, H), "white")
+
+
+def people() -> Image.Image:
+    req = urllib.request.Request(PEOPLE_PHOTO, headers={"User-Agent": "vlmrun-e2e"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return Image.open(io.BytesIO(resp.read())).convert("RGB").resize((W, H))
+
+
+class Camera:
+    """A participant that publishes whatever image is current, at 5 fps."""
+
+    def __init__(self, image: Image.Image) -> None:
+        self.room = rtc.Room()
+        self.source = rtc.VideoSource(W, H)
+        self.image = image
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self, room_name: str) -> None:
+        await self.room.connect(URL, token("camera", room_name))
+        track = rtc.LocalVideoTrack.create_video_track("camera", self.source)
+        opts = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
+        await self.room.local_participant.publish_track(track, opts)
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        while True:
+            rgba = self.image.convert("RGBA")
+            frame = rtc.VideoFrame(W, H, rtc.VideoBufferType.RGBA, rgba.tobytes())
+            self.source.capture_frame(frame)
+            await asyncio.sleep(0.2)
+
+    async def stop(self) -> None:
+        if self._task:
+            await utils.aio.cancel_and_wait(self._task)
+        await self.room.disconnect()
+
+
+async def plugin_in_room() -> None:
+    room_name = f"vlmrun-e2e-plugin-{uuid.uuid4().hex[:8]}"
+    camera = Camera(red_stop())
+    await camera.start(room_name)
+    observer = rtc.Room()
+    await observer.connect(URL, token("observer", room_name))
+
+    phase = "warmup"
+    seen: list[tuple[str, float]] = []
+    errors: list[str] = []
+    stream = vlmrun.VisionStream(
+        questions={"red": llm.Probability("A red circle is visible.")}, fps=2
+    )
+    stream.on("decision", lambda d: seen.append((phase, float(d.values["red"]))))
+    stream.on("error", lambda e: errors.append(f"{e.error_type}: {e.error}"))
+    await stream.start(observer)
+    latest = vtools._LatestVideoFrame(observer)
+    tools = vlmrun.VisionTools(frame_source=latest.get)
+
+    await asyncio.sleep(4)
+    phase = "red"
+    await asyncio.sleep(10)
+
+    try:
+        seg = await tools.segment_objects(query="red circle")
+        check("tools.segment_objects finds the circle", len(seg) >= 1, json.dumps(seg)[:160])
+    except Exception as e:
+        check("tools.segment_objects finds the circle", False, repr(e))
+    try:
+        text = await tools.read_text()
+        check("tools.read_text reads STOP", "STOP" in text.upper(), text[:160])
+    except Exception as e:
+        check("tools.read_text reads STOP", False, repr(e))
+    try:
+        frame = latest.get()
+        model = vlmrun.DecisionModel()
+        resp = await model.evaluate(
+            input="A camera frame.",
+            decisions={"red": llm.Probability("The image shows a red circle.")},
+            images=[llm.ImageContent(image=frame)] if frame is not None else [],
+        )
+        p = resp.results["red"].value
+        check("DecisionModel on a room frame", frame is not None and p > 0.5, f"p={p:.4f}")
+    except Exception as e:
+        check("DecisionModel on a room frame", False, repr(e))
+
+    camera.image = blank()
+    phase = "switching"
+    await asyncio.sleep(3)
+    phase = "blank"
+    await asyncio.sleep(10)
+
+    await stream.aclose()
+    await latest.aclose()
+    await observer.disconnect()
+    await camera.stop()
+
+    red = [p for ph, p in seen if ph == "red"]
+    white = [p for ph, p in seen if ph == "blank"]
+    check(
+        "VisionStream: red phase reads red",
+        len(red) >= 5 and statistics.median(red) > 0.5,
+        f"n={len(red)} median={statistics.median(red) if red else None}",
+    )
+    check(
+        "VisionStream: blank phase reads not red",
+        len(white) >= 5 and statistics.median(white) < 0.5,
+        f"n={len(white)} median={statistics.median(white) if white else None}",
+    )
+    check("VisionStream: no errors", not errors, "; ".join(errors[:3]))
+
+
+def start_agent(example: str, room_name: str) -> subprocess.Popen[bytes]:
+    log = open(f"/tmp/{example}.log", "wb")  # noqa: SIM115  # closed with the process
+    return subprocess.Popen(
+        [sys.executable, str(EXAMPLES / f"{example}.py"), "connect", "--room", room_name],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        cwd=EXAMPLES,
+    )
+
+
+def stop_agent(proc: subprocess.Popen[bytes], example: str) -> None:
+    proc.terminate()
+    try:
+        proc.wait(15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    print(f"--- tail of {example} log ---")
+    print(Path(f"/tmp/{example}.log").read_text(errors="replace")[-3000:], flush=True)
+
+
+async def collect_room(room: rtc.Room) -> tuple[list[str], list[dict]]:
+    said: list[str] = []
+    decisions: list[dict] = []
+
+    async def _read(reader: rtc.TextStreamReader) -> None:
+        text = await reader.read_all()
+        if text.strip():
+            said.append(text)
+
+    def _on_text(reader: rtc.TextStreamReader, identity: str) -> None:
+        asyncio.create_task(_read(reader))
+
+    def _on_data(packet: rtc.DataPacket) -> None:
+        if packet.topic == "vlmrun.decisions":
+            decisions.append(json.loads(packet.data))
+
+    room.register_text_stream_handler("lk.transcription", _on_text)
+    room.on("data_received", _on_data)
+    return said, decisions
+
+
+async def wait_until(pred, timeout: float) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        await asyncio.sleep(0.5)
+    return pred()
+
+
+async def watcher_example() -> None:
+    room_name = f"vlmrun-e2e-watcher-{uuid.uuid4().hex[:8]}"
+    camera = Camera(people())
+    await camera.start(room_name)
+    user = rtc.Room()
+    said, decisions = await collect_room(user)
+    await user.connect(URL, token("user", room_name))
+    proc = start_agent("vlmrun_watcher_agent", room_name)
+    try:
+        got_decisions = await wait_until(lambda: len(decisions) >= 3, 90)
+        persons = [d["values"].get("person") for d in decisions]
+        check(
+            "watcher: VLM Run decisions published to the room",
+            got_decisions and any(isinstance(p, float) and p > 0.8 for p in persons),
+            f"n={len(decisions)} person={persons[:5]}",
+        )
+        spoke = await wait_until(lambda: bool(said), 60)
+        check("watcher: agent greets the person it sees", spoke, (said[:2] or [""])[0][:160])
+    finally:
+        stop_agent(proc, "vlmrun_watcher_agent")
+        await user.disconnect()
+        await camera.stop()
+
+
+async def camera_example() -> None:
+    room_name = f"vlmrun-e2e-camera-{uuid.uuid4().hex[:8]}"
+    camera = Camera(red_stop())
+    await camera.start(room_name)
+    user = rtc.Room()
+    said, _ = await collect_room(user)
+    await user.connect(URL, token("user", room_name))
+    proc = start_agent("vlmrun_camera_agent", room_name)
+    try:
+        greeted = await wait_until(lambda: bool(said), 90)
+        check("camera: agent greets (vlmrun.LLM replied)", greeted, (said[:1] or [""])[0][:160])
+        before = len(said)
+        await user.local_participant.send_text(
+            "What color is the big round shape you see? Answer in one word.", topic="lk.chat"
+        )
+        answered = await wait_until(lambda: len(said) > before, 60)
+        reply = " ".join(said[before:])
+        check("camera: answers about the frame (red)", answered and "red" in reply.lower(), reply[:160])
+    finally:
+        stop_agent(proc, "vlmrun_camera_agent")
+        await user.disconnect()
+        await camera.stop()
+
+
+async def main() -> int:
+    async with utils.http_context.open():
+        for part in (plugin_in_room, watcher_example, camera_example):
+            print(f"=== {part.__name__} ===", flush=True)
+            try:
+                await part()
+            except Exception as e:
+                check(part.__name__, False, repr(e))
+    failed = [r for r in results if not r[1]]
+    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

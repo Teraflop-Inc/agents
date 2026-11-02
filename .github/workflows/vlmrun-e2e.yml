@@ -1,0 +1,30 @@
+name: vlmrun-e2e
+
+# Real-room check of the VLM Run plugin against LiveKit Cloud. Fork-only, not part of the PR.
+on:
+  push:
+    branches: [vlmrun-e2e]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv \
+            -e "livekit-agents[openai]" \
+            -e livekit-plugins/livekit-plugins-openai \
+            -e livekit-plugins/livekit-plugins-vlmrun \
+            livekit-api pillow python-dotenv
+      - name: Run
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          VLMRUN_API_KEY: ${{ secrets.VLMRUN_API_KEY }}
+        run: .venv/bin/python scripts/vlmrun_e2e/run.py
