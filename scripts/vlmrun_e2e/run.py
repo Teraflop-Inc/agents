@@ -269,7 +269,9 @@ async def camera_example() -> None:
         greeted = await wait_until(lambda: bool(said), 90)
         check("camera: agent greets (vlmrun.LLM replied)", greeted, (said[:1] or [""])[0][:160])
         before = len(said)
-        await user.local_participant.send_text(
+        # The agent listens to one participant (the first to join), and in a real app the
+        # person on camera is the one typing, so the question comes from the camera.
+        await camera.room.local_participant.send_text(
             "What color is the big round shape you see? Answer in one word.", topic="lk.chat"
         )
         answered = await wait_until(lambda: len(said) > before, 60)
