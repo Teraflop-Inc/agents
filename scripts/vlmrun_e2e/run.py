@@ -259,18 +259,16 @@ async def watcher_example() -> None:
 
 async def camera_example() -> None:
     room_name = f"vlmrun-e2e-camera-{uuid.uuid4().hex[:8]}"
+    # One participant publishes the camera, types and listens, as in a real app: the agent
+    # links to a single participant, so a second one would race it for the agent's attention.
     camera = Camera(red_stop())
+    said, _ = await collect_room(camera.room)
     await camera.start(room_name)
-    user = rtc.Room()
-    said, _ = await collect_room(user)
-    await user.connect(URL, token("user", room_name))
     proc = start_agent("vlmrun_camera_agent", room_name)
     try:
         greeted = await wait_until(lambda: bool(said), 90)
         check("camera: agent greets (vlmrun.LLM replied)", greeted, (said[:1] or [""])[0][:160])
         before = len(said)
-        # The agent listens to one participant (the first to join), and in a real app the
-        # person on camera is the one typing, so the question comes from the camera.
         await camera.room.local_participant.send_text(
             "What color is the big round shape you see? Answer in one word.", topic="lk.chat"
         )
@@ -283,7 +281,6 @@ async def camera_example() -> None:
         )
     finally:
         stop_agent(proc, "vlmrun_camera_agent")
-        await user.disconnect()
         await camera.stop()
 
 
