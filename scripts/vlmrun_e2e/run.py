@@ -207,8 +207,12 @@ async def collect_room(room: rtc.Room) -> tuple[list[str], list[dict]]:
         if text.strip():
             said.append(text)
 
+    tasks: set[asyncio.Task[None]] = set()
+
     def _on_text(reader: rtc.TextStreamReader, identity: str) -> None:
-        asyncio.create_task(_read(reader))
+        task = asyncio.create_task(_read(reader))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     def _on_data(packet: rtc.DataPacket) -> None:
         if packet.topic == "vlmrun.decisions":
@@ -269,7 +273,11 @@ async def camera_example() -> None:
         )
         answered = await wait_until(lambda: len(said) > before, 60)
         reply = " ".join(said[before:])
-        check("camera: answers about the frame (red)", answered and "red" in reply.lower(), reply[:160])
+        check(
+            "camera: answers about the frame (red)",
+            answered and "red" in reply.lower(),
+            reply[:160],
+        )
     finally:
         stop_agent(proc, "vlmrun_camera_agent")
         await user.disconnect()
