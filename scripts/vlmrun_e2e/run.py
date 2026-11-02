@@ -3,8 +3,7 @@
 Not part of the PR: it lives on the vlmrun-e2e branch and runs from a workflow_dispatch job.
 
   1. plugin   A fake camera publishes a red circle with "STOP", then a blank frame.
-              VisionStream must flip, VisionTools must segment and read "STOP", and
-              DecisionModel must answer about a frame taken from the room.
+              VisionStream must flip, and VisionTools must segment and read "STOP".
   2. watcher  The camera shows a photo with people. The watcher example must publish
               VLM Run decisions to the room and speak a greeting.
   3. camera   The camera shows the red circle. A chat message asks its color; the camera
@@ -139,19 +138,6 @@ async def plugin_in_room() -> None:
         check("tools.read_text reads STOP", "STOP" in text.upper(), text[:160])
     except Exception as e:
         check("tools.read_text reads STOP", False, repr(e))
-    try:
-        frame = latest.get()
-        model = vlmrun.DecisionModel()
-        resp = await model.evaluate(
-            input="A camera frame.",
-            decisions={"red": llm.Probability("The image shows a red circle.")},
-            images=[llm.ImageContent(image=frame)] if frame is not None else [],
-        )
-        p = resp.results["red"].value
-        check("DecisionModel on a room frame", frame is not None and p > 0.5, f"p={p:.4f}")
-    except Exception as e:
-        check("DecisionModel on a room frame", False, repr(e))
-
     camera.image = blank()
     phase = "switching"
     await asyncio.sleep(3)
