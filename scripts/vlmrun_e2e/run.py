@@ -2,10 +2,11 @@
 
 Not part of the PR: it lives on the vlmrun-e2e branch and runs from a workflow_dispatch job.
 
-  1. plugin   A fake camera publishes a red circle with "STOP", then a blank frame.
-              VisionStream must flip between them.
-  2. watcher  The camera shows a photo with people. The watcher example must publish
-              VLM Run decisions to the room and speak a greeting.
+  1. plugin   A fake camera publishes a photo with people, then a blank frame. VisionStream
+              (ViTPose over wss://gateway.vlm.run/v1/ws) must see people, then nobody, and
+              close its session when the camera leaves.
+  2. watcher  The camera shows a photo with people. The watcher agent, driven by pose
+              results, must speak a greeting.
   3. camera   The camera shows the red circle. A chat message asks its color; the camera
               example (vlmrun.LLM) must answer "red".
 
@@ -18,7 +19,6 @@ import asyncio
 import io
 import json
 import os
-import statistics
 import subprocess
 import sys
 import time
@@ -29,7 +29,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from livekit import api, rtc
-from livekit.agents import llm, utils
+from livekit.agents import utils
 from livekit.plugins import vlmrun
 
 URL = os.environ["LIVEKIT_URL"]
@@ -107,46 +107,57 @@ class Camera:
 
 async def plugin_in_room() -> None:
     room_name = f"vlmrun-e2e-plugin-{uuid.uuid4().hex[:8]}"
-    camera = Camera(red_stop())
+    camera = Camera(people())
     await camera.start(room_name)
     observer = rtc.Room()
     await observer.connect(URL, token("observer", room_name))
 
     phase = "warmup"
-    seen: list[tuple[str, float]] = []
+    seen: list[tuple[str, int]] = []
     errors: list[str] = []
-    stream = vlmrun.VisionStream(
-        questions={"red": llm.Probability("A red circle is visible.")}, fps=2
+    stats: list[dict] = []
+    stream = vlmrun.VisionStream(model="usyd-community/vitpose-plus-large", method="pose")
+    stream.on(
+        "result",
+        lambda r: seen.append((phase, len((r.content or {}).get("items", [])))),
     )
-    stream.on("decision", lambda d: seen.append((phase, float(d.values["red"]))))
     stream.on("error", lambda e: errors.append(f"{e.error_type}: {e.error}"))
+    stream.on("session_stats", stats.append)
     await stream.start(observer)
 
     await asyncio.sleep(4)
-    phase = "red"
-    await asyncio.sleep(10)
-
+    phase = "people"
+    await asyncio.sleep(8)
     camera.image = blank()
     phase = "switching"
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
     phase = "blank"
-    await asyncio.sleep(10)
+    await asyncio.sleep(8)
+
+    # The session must close when the camera leaves (the gateway bills open seconds).
+    phase = "gone"
+    await camera.stop()
+    closed = await wait_until(lambda: bool(stats), 15)
 
     await stream.aclose()
     await observer.disconnect()
-    await camera.stop()
 
-    red = [p for ph, p in seen if ph == "red"]
-    white = [p for ph, p in seen if ph == "blank"]
+    with_people = [n for ph, n in seen if ph == "people"]
+    empty = [n for ph, n in seen if ph == "blank"]
     check(
-        "VisionStream: red phase reads red",
-        len(red) >= 5 and statistics.median(red) > 0.5,
-        f"n={len(red)} median={statistics.median(red) if red else None}",
+        "VisionStream: people photo returns people",
+        len(with_people) >= 5 and all(n > 0 for n in with_people),
+        f"n={len(with_people)} people per frame={sorted(set(with_people))}",
     )
     check(
-        "VisionStream: blank phase reads not red",
-        len(white) >= 5 and statistics.median(white) < 0.5,
-        f"n={len(white)} median={statistics.median(white) if white else None}",
+        "VisionStream: blank frame returns nobody",
+        len(empty) >= 5 and all(n == 0 for n in empty),
+        f"n={len(empty)} people per frame={sorted(set(empty))}",
+    )
+    check(
+        "VisionStream: session closes when the camera leaves",
+        closed,
+        json.dumps(stats[-1])[:200] if stats else "no session.stats",
     )
     check("VisionStream: no errors", not errors, "; ".join(errors[:3]))
 
@@ -209,24 +220,18 @@ async def wait_until(pred, timeout: float) -> bool:
 async def watcher_example() -> None:
     room_name = f"vlmrun-e2e-watcher-{uuid.uuid4().hex[:8]}"
     camera = Camera(people())
+    said, _ = await collect_room(camera.room)
     await camera.start(room_name)
-    user = rtc.Room()
-    said, decisions = await collect_room(user)
-    await user.connect(URL, token("user", room_name))
     proc = start_agent("vlmrun_watcher_agent", room_name)
     try:
-        got_decisions = await wait_until(lambda: len(decisions) >= 3, 90)
-        persons = [d["values"].get("person") for d in decisions]
+        spoke = await wait_until(lambda: bool(said), 90)
         check(
-            "watcher: VLM Run decisions published to the room",
-            got_decisions and any(isinstance(p, float) and p > 0.8 for p in persons),
-            f"n={len(decisions)} person={persons[:5]}",
+            "watcher: greets when the pose model sees people",
+            spoke,
+            (said[:1] or [""])[0].strip()[:160],
         )
-        spoke = await wait_until(lambda: bool(said), 60)
-        check("watcher: agent greets the person it sees", spoke, (said[:2] or [""])[0][:160])
     finally:
         stop_agent(proc, "vlmrun_watcher_agent")
-        await user.disconnect()
         await camera.stop()
 
 

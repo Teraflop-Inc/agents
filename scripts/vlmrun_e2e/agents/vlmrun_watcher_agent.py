@@ -1,8 +1,8 @@
-"""A voice agent that watches the user's camera and speaks up when something changes.
+"""A voice agent that watches the user's camera and speaks up when someone comes into view.
 
-VLM Run reads every sampled frame over one WebSocket (``vlmrun.VisionStream``) and
-answers typed questions about it. When the probability that a person is in frame
-crosses a threshold, the agent says so.
+VLM Run's pose model reads the camera over the gateway's realtime socket
+(``vlmrun.VisionStream``). When people appear in its results, the agent greets them; when
+they have been gone for a few frames, it says so.
 
 Run with ``VLMRUN_API_KEY`` set, then join the room with a camera on:
 
@@ -13,16 +13,15 @@ import logging
 
 from dotenv import load_dotenv
 
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, inference, llm
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, inference
 from livekit.plugins import vlmrun
 
 logger = logging.getLogger("vlmrun-watcher")
 
 load_dotenv()
 
-# Enter above ENTER, leave below LEAVE, so a flickering score doesn't repeat itself.
-ENTER = 0.8
-LEAVE = 0.3
+# Frames without anyone before the agent says the person left, so a missed frame doesn't.
+GONE_AFTER = 5
 
 
 class WatcherAgent(Agent):
@@ -44,41 +43,26 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=inference.TTS("cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
     )
 
-    watcher = vlmrun.VisionStream(
-        questions={
-            "person": llm.Probability("A person is visible in the frame."),
-            "activity": llm.Choice(
-                "What is the person doing?",
-                options={
-                    "waving": "Waving at the camera",
-                    "working": "Working at a desk or computer",
-                    "other": "Anything else, or no person",
-                },
-            ),
-        },
-        state="A webcam pointed at a desk.",
-        fps=2,
-        publish_topic="vlmrun.decisions",
-    )
-
+    watcher = vlmrun.VisionStream(model="usyd-community/vitpose-plus-large", method="pose")
     present = False
+    empty_frames = 0
 
-    @watcher.on("decision")
-    def _on_decision(decision: vlmrun.FrameDecision) -> None:
-        nonlocal present
-        person = decision.values.get("person")
-        if not isinstance(person, float):
-            return
-        if not present and person >= ENTER:
-            present = True
-            activity = decision.values.get("activity", "other")
-            session.generate_reply(
-                instructions=f"Someone just came into view (they look to be {activity}). "
-                "Greet them briefly."
-            )
-        elif present and person <= LEAVE:
-            present = False
-            session.generate_reply(instructions="The person left the frame. Say so briefly.")
+    @watcher.on("result")
+    def _on_result(result: vlmrun.FrameResult) -> None:
+        nonlocal present, empty_frames
+        people = len((result.content or {}).get("items", []))
+        if people:
+            empty_frames = 0
+            if not present:
+                present = True
+                session.generate_reply(
+                    instructions=f"{people} person(s) just came into view. Greet them briefly."
+                )
+        elif present:
+            empty_frames += 1
+            if empty_frames >= GONE_AFTER:
+                present = False
+                session.generate_reply(instructions="Everyone left the frame. Say so briefly.")
 
     @watcher.on("error")
     def _on_error(error: vlmrun.VisionStreamError) -> None:
