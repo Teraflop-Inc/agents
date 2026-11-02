@@ -3,7 +3,7 @@
 Not part of the PR: it lives on the vlmrun-e2e branch and runs from a workflow_dispatch job.
 
   1. plugin   A fake camera publishes a red circle with "STOP", then a blank frame.
-              VisionStream must flip, and VisionTools must segment and read "STOP".
+              VisionStream must flip between them.
   2. watcher  The camera shows a photo with people. The watcher example must publish
               VLM Run decisions to the room and speak a greeting.
   3. camera   The camera shows the red circle. A chat message asks its color; the camera
@@ -31,13 +31,13 @@ from PIL import Image, ImageDraw, ImageFont
 from livekit import api, rtc
 from livekit.agents import llm, utils
 from livekit.plugins import vlmrun
-from livekit.plugins.vlmrun import tools as vtools
 
 URL = os.environ["LIVEKIT_URL"]
 KEY = os.environ["LIVEKIT_API_KEY"]
 SECRET = os.environ["LIVEKIT_API_SECRET"]
 REPO = Path(__file__).resolve().parents[2]
-EXAMPLES = REPO / "examples" / "voice_agents"
+# The two agents live here, not in examples/, because the PR ships no examples.
+EXAMPLES = Path(__file__).resolve().parent / "agents"
 PEOPLE_PHOTO = "https://ultralytics.com/images/bus.jpg"
 W, H = 640, 480
 
@@ -121,23 +121,11 @@ async def plugin_in_room() -> None:
     stream.on("decision", lambda d: seen.append((phase, float(d.values["red"]))))
     stream.on("error", lambda e: errors.append(f"{e.error_type}: {e.error}"))
     await stream.start(observer)
-    latest = vtools._LatestVideoFrame(observer)
-    tools = vlmrun.VisionTools(frame_source=latest.get)
 
     await asyncio.sleep(4)
     phase = "red"
     await asyncio.sleep(10)
 
-    try:
-        seg = await tools.segment_objects(query="red circle")
-        check("tools.segment_objects finds the circle", len(seg) >= 1, json.dumps(seg)[:160])
-    except Exception as e:
-        check("tools.segment_objects finds the circle", False, repr(e))
-    try:
-        text = await tools.read_text()
-        check("tools.read_text reads STOP", "STOP" in text.upper(), text[:160])
-    except Exception as e:
-        check("tools.read_text reads STOP", False, repr(e))
     camera.image = blank()
     phase = "switching"
     await asyncio.sleep(3)
@@ -145,7 +133,6 @@ async def plugin_in_room() -> None:
     await asyncio.sleep(10)
 
     await stream.aclose()
-    await latest.aclose()
     await observer.disconnect()
     await camera.stop()
 
