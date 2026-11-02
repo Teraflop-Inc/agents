@@ -28,3 +28,9 @@ jobs:
           LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
           VLMRUN_API_KEY: ${{ secrets.VLMRUN_API_KEY }}
         run: .venv/bin/python scripts/vlmrun_e2e/run.py
+      - name: Upload agent logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-logs
+          path: /tmp/vlmrun_*.log

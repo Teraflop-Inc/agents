@@ -194,8 +194,9 @@ def stop_agent(proc: subprocess.Popen[bytes], example: str) -> None:
         proc.wait(15)
     except subprocess.TimeoutExpired:
         proc.kill()
-    print(f"--- tail of {example} log ---")
-    print(Path(f"/tmp/{example}.log").read_text(errors="replace")[-3000:], flush=True)
+    log = Path(f"/tmp/{example}.log").read_text(errors="replace")
+    print(f"--- {example} log: {len(log)} chars, full copy in /tmp/{example}.log ---")
+    print(log[-3000:], flush=True)
 
 
 async def collect_room(room: rtc.Room) -> tuple[list[str], list[dict]]:
